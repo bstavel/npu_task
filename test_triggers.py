@@ -20,7 +20,7 @@ import serial.tools.list_ports
 SERIAL_BAUD = 9600
 TTL_STARTLE = 4
 TTL_SHOCK_MARKER = 2
-TTL_SHOCK_TRIGGER = 8
+TTL_SHOCK_TRIGGER = 128
 TTL_PULSE_DURATION = 0.01
 
 
@@ -84,22 +84,40 @@ def main():
 
         time.sleep(1)
 
-        # -- Test 3: Shock trigger TTL ---
-        input("Press ENTER to send SHOCK TRIGGER (code 8 -> stimulator)...")
-        pulse(ser, TTL_SHOCK_TRIGGER, "shock trigger -> stimulator")
-        print("  -> Verify: stimulator should have received a TTL on bit 3 (code 8)\n")
+        # -- Test 3: BNC scan ---
+        print("-- BNC SCAN --")
+        print("This will try each BNC code one at a time.")
+        print("Watch the stimulator and note which code triggers it.\n")
+        bnc_codes = [
+            (8,   "BNC bit 3"),
+            (16,  "BNC bit 4"),
+            (32,  "BNC bit 5"),
+            (64,  "BNC bit 6"),
+            (128, "BNC bit 7"),
+        ]
+        for code, label in bnc_codes:
+            input(f"Press ENTER to send code {code:>3d} ({label})...")
+            pulse(ser, code, label)
+            print(f"  -> Did the stimulator fire? (if yes, use code {code} in npu_task.py)\n")
 
         time.sleep(1)
 
-        # -- Test 4: Full shock sequence (marker then trigger) ---
-        input("Press ENTER to send FULL SHOCK SEQUENCE (code 2 then code 8)...")
+        # -- Test 4: Shock trigger TTL (current setting) ---
+        input(f"Press ENTER to send SHOCK TRIGGER (code {TTL_SHOCK_TRIGGER} -> stimulator)...")
+        pulse(ser, TTL_SHOCK_TRIGGER, "shock trigger -> stimulator")
+        print(f"  -> Verify: stimulator should have received code {TTL_SHOCK_TRIGGER}\n")
+
+        time.sleep(1)
+
+        # -- Test 5: Full shock sequence (marker then trigger) ---
+        input(f"Press ENTER to send FULL SHOCK SEQUENCE (code 2 then code {TTL_SHOCK_TRIGGER})...")
         pulse(ser, TTL_SHOCK_MARKER, "shock marker -> SAGA")
         pulse(ser, TTL_SHOCK_TRIGGER, "shock trigger -> stimulator")
-        print("  -> Verify: SAGA got code 2, then stimulator got code 8\n")
+        print(f"  -> Verify: SAGA got code 2, then stimulator got code {TTL_SHOCK_TRIGGER}\n")
 
         time.sleep(1)
 
-        # -- Test 5: Rapid repeat ---
+        # -- Test 6: Rapid repeat ---
         input("Press ENTER to send 5 rapid startle probes (1s apart)...")
         for i in range(5):
             print(f"  Probe {i + 1}/5")

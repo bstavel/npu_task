@@ -24,6 +24,13 @@ import time
 import random
 from datetime import datetime
 
+try:
+    import serial
+    import serial.tools.list_ports
+    HAS_PYSERIAL = True
+except ImportError:
+    HAS_PYSERIAL = False
+
 # ════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ════════════════════════════════════════════════════════════════
@@ -65,10 +72,58 @@ CONTEXT_TEXT = {
     "U": "Shock at any time",
 }
 
+# Serial / TTL trigger settings
+USE_SERIAL = True               # set False to run without serial hardware
+SERIAL_BAUD = 9600              # baud rate for the serial splitter
+TTL_STARTLE = 4                 # code 4 → SAGA (marks startle probe)
+TTL_SHOCK_MARKER = 2            # code 2 → SAGA (marks shock event)
+TTL_SHOCK_TRIGGER = 128           # code 128 → stimulator (delivers shock)
+TTL_PULSE_DURATION = 0.01       # seconds to hold line high before reset
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-STIMULI_DIR = os.path.join(SCRIPT_DIR, "NPU_orginal")
+STIMULI_DIR = os.path.join(SCRIPT_DIR, "stimuli")
 DATA_DIR = os.path.join(SCRIPT_DIR, "npu_data")
 STARTLE_WAV = "npustim.wav"
+
+
+# ════════════════════════════════════════════════════════════════
+# SERIAL TTL TRIGGER
+# ════════════════════════════════════════════════════════════════
+
+class SerialTrigger:
+    """Sends TTL pulse codes over a serial port to the SAGA/stimulator splitter."""
+
+    def __init__(self, port, baud=SERIAL_BAUD):
+        self._ser = serial.Serial(port, baud)
+        self._ser.flush()
+
+    def _pulse(self, code):
+        """Write a single TTL code, flush, hold, then reset to 0."""
+        self._ser.write(bytes([code]))
+        self._ser.flush()
+        time.sleep(TTL_PULSE_DURATION)
+        self._ser.write(bytes([0x00]))
+        self._ser.flush()
+
+    def send_startle(self):
+        self._pulse(TTL_STARTLE)
+
+    def send_shock(self):
+        self._pulse(TTL_SHOCK_MARKER)
+        self._pulse(TTL_SHOCK_TRIGGER)
+
+    def close(self):
+        if self._ser and self._ser.is_open:
+            self._ser.write(bytes([0x00]))
+            self._ser.flush()
+            self._ser.close()
+
+
+class DummyTrigger:
+    """No-op stand-in when serial is disabled."""
+    def send_startle(self): pass
+    def send_shock(self): pass
+    def close(self): pass
 
 
 # ════════════════════════════════════════════════════════════════
@@ -354,10 +409,10 @@ class Display:
         self.W = screen.get_width()
         self.H = screen.get_height()
         # fonts
-        self.font_title = pygame.font.Font(None, 72)
-        self.font_body  = pygame.font.Font(None, 48)
-        self.font_small = pygame.font.Font(None, 36)
-        self.font_ctx   = pygame.font.Font(None, 60)
+        self.font_title = pygame.font.Font(None, 96)
+        self.font_body  = pygame.font.Font(None, 64)
+        self.font_small = pygame.font.Font(None, 48)
+        self.font_ctx   = pygame.font.Font(None, 80)
         # cue images (scaled to ~1/4 of screen height)
         cue_size = int(self.H * 0.28)
         self.cue_images = {}
@@ -470,9 +525,9 @@ class Display:
 # ════════════════════════════════════════════════════════════════
 
 def startup_screen(screen):
-    """Collect participant ID and block-order selection.
+    """Collect participant ID, block-order, and serial port selection.
 
-    Returns (participant_id: str, block_order: int) or calls sys.exit().
+    Returns (participant_id: str, block_order: int, serial_port: str or None).
     """
     W, H = screen.get_width(), screen.get_height()
     font_t = pygame.font.Font(None, 72)
@@ -481,7 +536,9 @@ def startup_screen(screen):
 
     pid = ""
     order = None
-    phase = "id"                  # 'id' → 'order'
+    serial_port = None
+    ports = []
+    phase = "id"                  # 'id' → 'order' → 'serial'
     clock = pygame.time.Clock()
 
     while True:
@@ -494,7 +551,7 @@ def startup_screen(screen):
                          HIGHLIGHT_COLOR)
             _blit_center(screen, font_s, "Press ENTER when done",
                          H * 3 // 4, MUTED_TEXT)
-        else:
+        elif phase == "order":
             _blit_center(screen, font_t, f"Participant: {pid}", H // 5)
             _blit_center(screen, font_m, "Select Block 1 order:", H // 3)
             _blit_center(screen, font_m, "Press 1:  P N U N U N P",
@@ -503,6 +560,20 @@ def startup_screen(screen):
                          H // 2 + 40, HIGHLIGHT_COLOR)
             _blit_center(screen, font_s,
                          "(Block 2 will use the opposite order)",
+                         H * 3 // 4, MUTED_TEXT)
+        elif phase == "serial":
+            _blit_center(screen, font_t, "Select Serial Port", H // 6)
+            if ports:
+                y = H // 3
+                for i, p in enumerate(ports):
+                    label = f"Press {i + 1}:  {p.device}  ({p.description})"
+                    _blit_center(screen, font_m, label, y, HIGHLIGHT_COLOR)
+                    y += 50
+            else:
+                _blit_center(screen, font_m, "No serial ports detected.",
+                             H // 2, (200, 0, 0))
+            _blit_center(screen, font_s,
+                         "Press 0 to skip (no TTL output)",
                          H * 3 // 4, MUTED_TEXT)
 
         pygame.display.flip()
@@ -521,13 +592,33 @@ def startup_screen(screen):
                     elif ev.unicode and (ev.unicode.isalnum()
                                          or ev.unicode in "_-"):
                         pid += ev.unicode
-                else:
+                elif phase == "order":
                     if ev.key in (pygame.K_1, pygame.K_KP1):
                         order = 1
                     elif ev.key in (pygame.K_2, pygame.K_KP2):
                         order = 2
                     if order is not None:
-                        return pid, order
+                        if USE_SERIAL and HAS_PYSERIAL:
+                            ports = list(serial.tools.list_ports.comports())
+                            phase = "serial"
+                        else:
+                            return pid, order, None
+                elif phase == "serial":
+                    if ev.key in (pygame.K_0, pygame.K_KP0):
+                        return pid, order, None
+                    num_keys = [
+                        pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4,
+                        pygame.K_5, pygame.K_6, pygame.K_7, pygame.K_8,
+                        pygame.K_9,
+                    ]
+                    kp_keys = [
+                        pygame.K_KP1, pygame.K_KP2, pygame.K_KP3,
+                        pygame.K_KP4, pygame.K_KP5, pygame.K_KP6,
+                        pygame.K_KP7, pygame.K_KP8, pygame.K_KP9,
+                    ]
+                    for i, (nk, kp) in enumerate(zip(num_keys, kp_keys)):
+                        if ev.key in (nk, kp) and i < len(ports):
+                            return pid, order, ports[i].device
 
         clock.tick(FPS)
 
@@ -586,7 +677,7 @@ def show_instructions(disp):
 # MAIN EXPERIMENT LOOP
 # ════════════════════════════════════════════════════════════════
 
-def run_phase(display, logger, events, startle_sound, block_num):
+def run_phase(display, logger, events, startle_sound, block_num, trigger=None):
     """Execute a pre-generated schedule of events in real time.
 
     `events` have times relative to phase start (t = 0).
@@ -654,6 +745,8 @@ def run_phase(display, logger, events, startle_sound, block_num):
 
             elif etype == "startle_probe":
                 startle_sound.play()
+                if trigger:
+                    trigger.send_startle()
                 logger.log("startle_probe", block=block_num,
                            condition=evt.get("condition", "HAB"),
                            context=evt.get("context", "ITI"),
@@ -661,7 +754,8 @@ def run_phase(display, logger, events, startle_sound, block_num):
                            cue_number=evt.get("cue_index", -1))
 
             elif etype == "shock":
-                # TODO: send shock via serial port
+                if trigger:
+                    trigger.send_shock()
                 shock_elapsed = now - phase_start
                 print(f"[SHOCK] t={shock_elapsed:.2f}s  "
                       f"condition={evt['condition']}  "
@@ -714,7 +808,15 @@ def main():
     pygame.mouse.set_visible(False)
 
     # ── startup dialog ───────────────────────────────────────
-    pid, block_order = startup_screen(screen)
+    pid, block_order, serial_port = startup_screen(screen)
+
+    # ── initialise serial trigger ─────────────────────────────
+    if serial_port:
+        trigger = SerialTrigger(serial_port, SERIAL_BAUD)
+        print(f"[SERIAL] Opened {serial_port} @ {SERIAL_BAUD} baud")
+    else:
+        trigger = DummyTrigger()
+        print("[SERIAL] Disabled — no TTL output")
 
     # ── prepare logging ──────────────────────────────────────
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -757,30 +859,31 @@ def main():
     validate_schedule(b2_evts)
 
     # ── run pre-test habituation ─────────────────────────────
-    if run_phase(disp, logger, pre_hab_evts, startle, block_num=0):
+    if run_phase(disp, logger, pre_hab_evts, startle, block_num=0, trigger=trigger):
         logger.log("experiment_abort")
-        logger.close(); pygame.quit(); return
+        trigger.close(); logger.close(); pygame.quit(); return
 
     # ── run block 1 ──────────────────────────────────────────
-    if run_phase(disp, logger, b1_evts, startle, block_num=1):
+    if run_phase(disp, logger, b1_evts, startle, block_num=1, trigger=trigger):
         logger.log("experiment_abort")
-        logger.close(); pygame.quit(); return
+        trigger.close(); logger.close(); pygame.quit(); return
 
     # ── break ────────────────────────────────────────────────
     logger.log("break_start")
     if disp.break_screen():
         logger.log("experiment_abort")
-        logger.close(); pygame.quit(); return
+        trigger.close(); logger.close(); pygame.quit(); return
     logger.log("break_end")
 
     # ── run block 2 ──────────────────────────────────────────
-    if run_phase(disp, logger, b2_evts, startle, block_num=2):
+    if run_phase(disp, logger, b2_evts, startle, block_num=2, trigger=trigger):
         logger.log("experiment_abort")
-        logger.close(); pygame.quit(); return
+        trigger.close(); logger.close(); pygame.quit(); return
 
     # ── done ─────────────────────────────────────────────────
     logger.log("experiment_end")
     disp.end_screen()
+    trigger.close()
     logger.close()
     pygame.quit()
 

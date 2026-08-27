@@ -68,9 +68,9 @@ The task sends TTL codes over a serial port to a splitter (DUB-26 / BNC):
 |---------------|------|--------------------------|
 | Startle probe | 4    | SAGA (EMG marker)        |
 | Shock marker  | 2    | SAGA (shock event marker) |
-| Shock trigger | 8    | Stimulator (delivers shock) |
+| Shock trigger | 128  | Stimulator (delivers shock) |
 
-On shock events, code 2 and code 8 are sent sequentially with a buffer flush between them.
+On shock events, code 2 and code 128 are sent sequentially with a buffer flush between them.
 
 Set `USE_SERIAL = False` in `npu_task.py` to run without serial hardware.
 
