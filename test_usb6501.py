@@ -5,9 +5,9 @@ Standalone check of the NI USB-6501 on macOS, before wiring it into npu_task.py.
 Runs in stages so you can see exactly where things break:
   1. libusb backend is loadable by PyUSB
   2. The USB-6501 is visible on the USB bus
-  3. The ni-usb-6501 driver can connect and configure port 0 as output
-  4. Read-back: writing a value to port 0 and reading it back matches
-  5. Line scan: pulse each line P0.0-P0.7 one at a time (watch SAGA / stimulator)
+  3. The ni-usb-6501 driver can connect and configure the port as output
+  4. Read-back: writing a value to the port and reading it back matches
+  5. Line scan: pulse each line of the port one at a time (watch SAGA / stimulator)
   6. Task codes: pulse the codes npu_task.py uses
 
 Setup:
@@ -24,12 +24,14 @@ import time
 # Must match the constants in npu_task.py
 TTL_STARTLE = 4
 TTL_SHOCK_MARKER = 2
-TTL_SHOCK_TRIGGER = 128
+TTL_SHOCK_TRIGGER = 8          # MATLAB_mn_stim.m: 8 fires the stimulator
 TTL_PULSE_DURATION = 0.01
 
 NI_VENDOR_ID = 0x3923
 NI_6501_PRODUCT_ID = 0x718A
-PORT = 0
+# MATLAB_mn_stim.m drives 'Dev2/Port1/Line0:7', so the splitter is wired to port 1.
+# Override on the command line, e.g. `python test_usb6501.py 0`.
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
 
 def stage(n, msg):
@@ -88,17 +90,19 @@ def main():
     ni_driver.time = time  # driver's retry path uses `time` without importing it
     try:
         dev = ni_driver.NIUSB6501()
-        dev.set_io_mode(0xFF, 0x00, 0x00)  # port 0 all outputs, ports 1-2 inputs
+        modes = [0x00, 0x00, 0x00]
+        modes[PORT] = 0xFF  # selected port all outputs, others inputs
+        dev.set_io_mode(*modes)
         dev.write_port(PORT, 0)
     except Exception as e:
         fail(f"{type(e).__name__}: {e}\n"
              "  If this is an access/permission error, try running once with sudo\n"
              "  to confirm, then let me know.")
-    print("  OK: connected, port 0 set to output, all lines low")
+    print(f"  OK: connected, port {PORT} set to output, all lines low")
 
     try:
         # -- 4. Read-back ---
-        stage(4, "Write/read-back test on port 0 (no pulses, lines go high briefly)...")
+        stage(4, f"Write/read-back test on port {PORT} (no pulses, lines go high briefly)...")
         mismatches = 0
         for val in (0x00, 0x55, 0xAA, 0x00):
             dev.write_port(PORT, val)
@@ -116,8 +120,8 @@ def main():
         print("  (Turn the stimulator output DOWN / disconnect the participant first!)")
         for line in range(8):
             code = 1 << line
-            input(f"\n  ENTER to pulse P0.{line} (code {code})...")
-            pulse(dev, code, f"P0.{line}")
+            input(f"\n  ENTER to pulse P{PORT}.{line} (code {code})...")
+            pulse(dev, code, f"P{PORT}.{line}")
             print("  -> Which device saw it: SAGA, stimulator, or neither?")
 
         # -- 6. Task codes ---
