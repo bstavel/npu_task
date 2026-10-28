@@ -33,7 +33,15 @@ Block order is counterbalanced across participants (order 1: P N U N U N P, orde
 pip install -r requirements.txt
 ```
 
-Dependencies: `pygame`, `pyserial` (required when using serial TTL output).
+Dependencies: `pygame`, `pyusb`, `ni-usb-6501` (for TTL output via the NI USB-6501).
+
+On macOS, PyUSB also needs libusb:
+
+```
+brew install libusb
+```
+
+NI-DAQmx is not needed (and does not run on macOS); the `ni-usb-6501` package talks to the device directly over libusb.
 
 ### Stimuli
 
@@ -56,31 +64,30 @@ The startup screen collects:
 
 1. **Participant ID** — typed, press ENTER to confirm
 2. **Block order** — press 1 or 2
-3. **Serial port** — auto-detected list, press number to select (or 0 to skip)
+3. **TTL trigger** — connects to the NI USB-6501; ENTER to continue, R to retry, 0 to skip
 
 Data is saved to `npu_data/sub-{pid}_npu_{timestamp}.csv`.
 
-## Serial TTL Output
+## TTL Output
 
-The task sends TTL codes over a serial port to a splitter (DUB-26 / BNC):
+The task drives port 1 (P1.0–P1.7) of an NI USB-6501, which feeds the Cortech trigger splitter to SAGA and the Digitimer stimulator:
 
-| Event         | Code | Destination              |
-|---------------|------|--------------------------|
-| Startle probe | 4    | SAGA (EMG marker)        |
-| Shock marker  | 2    | SAGA (shock event marker) |
-| Shock trigger | 128  | Stimulator (delivers shock) |
+| Event         | Code | Line | Destination                    |
+|---------------|------|------|--------------------------------|
+| Startle probe | 128  | P1.7 | SAGA (startle marker)          |
+| Shock         | 8    | P1.3 | Stimulator (shock) + SAGA marker |
 
-On shock events, code 2 and code 128 are sent sequentially with a buffer flush between them.
+Each code is held for `TTL_PULSE_DURATION` (10 ms) then reset to 0.
 
-Set `USE_SERIAL = False` in `npu_task.py` to run without serial hardware.
+Set `USE_TTL = False` in `npu_task.py` to run without trigger hardware.
 
 ### Testing Triggers
 
 ```
-python test_triggers.py
+python test_usb6501.py
 ```
 
-Walks through each trigger type interactively so you can verify SAGA and stimulator reception before running the full task.
+Checks libusb, finds the device, then walks through a line scan and the task codes interactively so you can verify SAGA and stimulator reception before running the full task. Pass a port number to scan a different port (e.g. `python test_usb6501.py 0`).
 
 ## Output
 
@@ -109,8 +116,10 @@ Key constants at the top of `npu_task.py`:
 | `CUE_DURATION` | `8.0` | Cue display time (seconds) |
 | `MIN_PROBE_INTERVAL` | `20.0` | Minimum gap between startle probes |
 | `SHOCKS_PER_BLOCK` | `6` | Total shocks per block |
-| `USE_SERIAL` | `True` | Enable/disable serial TTL output |
-| `SERIAL_BAUD` | `9600` | Serial port baud rate |
+| `USE_TTL` | `True` | Enable/disable TTL output |
+| `TTL_PORT` | `1` | USB-6501 port wired to the splitter |
+| `TTL_STARTLE` | `128` | Startle probe code |
+| `TTL_SHOCK` | `8` | Shock code |
 
 ## Reference
 

@@ -22,9 +22,8 @@ import sys
 import time
 
 # Must match the constants in npu_task.py
-TTL_STARTLE = 4
-TTL_SHOCK_MARKER = 2
-TTL_SHOCK_TRIGGER = 8          # MATLAB_mn_stim.m: 8 fires the stimulator
+TTL_STARTLE = 128              # P1.7 -> SAGA marker
+TTL_SHOCK = 8                  # P1.3 -> stimulator + SAGA marker
 TTL_PULSE_DURATION = 0.01
 
 NI_VENDOR_ID = 0x3923
@@ -128,10 +127,8 @@ def main():
         stage(6, "Pulsing the codes npu_task.py uses...")
         input(f"\n  ENTER to send STARTLE (code {TTL_STARTLE} -> SAGA)...")
         pulse(dev, TTL_STARTLE, "startle -> SAGA")
-        input(f"\n  ENTER to send SHOCK MARKER + TRIGGER "
-              f"(code {TTL_SHOCK_MARKER} then {TTL_SHOCK_TRIGGER})...")
-        pulse(dev, TTL_SHOCK_MARKER, "shock marker -> SAGA")
-        pulse(dev, TTL_SHOCK_TRIGGER, "shock trigger -> stimulator")
+        input(f"\n  ENTER to send SHOCK (code {TTL_SHOCK} -> stimulator + SAGA)...")
+        pulse(dev, TTL_SHOCK, "shock -> stimulator + SAGA")
 
         input("\n  ENTER to send 5 startle pulses, 1 s apart...")
         for i in range(5):

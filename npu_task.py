@@ -12,7 +12,7 @@ This script implements the full NPU-threat test with:
   - Two blocks of 7 conditions each (P N U N U N P  or  U N P N P N U)
   - Counterbalanced block order
   - Startle probes during cue and ITI periods
-  - Shock event scheduling (placeholder — serial delivery added later)
+  - TTL triggers to SAGA / stimulator via an NI USB-6501
   - Detailed CSV event log with millisecond-precision timestamps
 """
 
@@ -25,11 +25,11 @@ import random
 from datetime import datetime
 
 try:
-    import serial
-    import serial.tools.list_ports
-    HAS_PYSERIAL = True
+    import ni_usb_6501.driver as ni_driver
+    ni_driver.time = time       # driver's retry path uses `time` without importing it
+    HAS_NI6501 = True
 except ImportError:
-    HAS_PYSERIAL = False
+    HAS_NI6501 = False
 
 # ════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -72,12 +72,11 @@ CONTEXT_TEXT = {
     "U": "Shock at any time",
 }
 
-# Serial / TTL trigger settings
-USE_SERIAL = True               # set False to run without serial hardware
-SERIAL_BAUD = 9600              # baud rate for the serial splitter
-TTL_STARTLE = 4                 # code 4 → SAGA (marks startle probe)
-TTL_SHOCK_MARKER = 2            # code 2 → SAGA (marks shock event)
-TTL_SHOCK_TRIGGER = 128           # code 128 → stimulator (delivers shock)
+# TTL trigger settings (NI USB-6501 → Cortech splitter → SAGA / stimulator)
+USE_TTL = True                  # set False to run without trigger hardware
+TTL_PORT = 1                    # USB-6501 port wired to the splitter (P1.0-P1.7)
+TTL_STARTLE = 128               # code 128 (P1.7) → SAGA (marks startle probe)
+TTL_SHOCK = 8                   # code 8 (P1.3) → stimulator (shock) + SAGA marker
 TTL_PULSE_DURATION = 0.01       # seconds to hold line high before reset
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -87,40 +86,41 @@ STARTLE_WAV = "npustim.wav"
 
 
 # ════════════════════════════════════════════════════════════════
-# SERIAL TTL TRIGGER
+# NI USB-6501 TTL TRIGGER
 # ════════════════════════════════════════════════════════════════
 
-class SerialTrigger:
-    """Sends TTL pulse codes over a serial port to the SAGA/stimulator splitter."""
+class NI6501Trigger:
+    """Sends TTL pulse codes on one USB-6501 port to the SAGA/stimulator splitter."""
 
-    def __init__(self, port, baud=SERIAL_BAUD):
-        self._ser = serial.Serial(port, baud)
-        self._ser.flush()
+    def __init__(self, port=TTL_PORT):
+        self._port = port
+        self._dev = ni_driver.NIUSB6501()
+        modes = [0x00, 0x00, 0x00]
+        modes[port] = 0xFF          # selected port all outputs, others inputs
+        self._dev.set_io_mode(*modes)
+        self._dev.write_port(port, 0)
 
     def _pulse(self, code):
-        """Write a single TTL code, flush, hold, then reset to 0."""
-        self._ser.write(bytes([code]))
-        self._ser.flush()
+        """Set the port to `code`, hold, then reset to 0."""
+        self._dev.write_port(self._port, code)
         time.sleep(TTL_PULSE_DURATION)
-        self._ser.write(bytes([0x00]))
-        self._ser.flush()
+        self._dev.write_port(self._port, 0)
 
     def send_startle(self):
         self._pulse(TTL_STARTLE)
 
     def send_shock(self):
-        self._pulse(TTL_SHOCK_MARKER)
-        self._pulse(TTL_SHOCK_TRIGGER)
+        self._pulse(TTL_SHOCK)
 
     def close(self):
-        if self._ser and self._ser.is_open:
-            self._ser.write(bytes([0x00]))
-            self._ser.flush()
-            self._ser.close()
+        if self._dev:
+            self._dev.write_port(self._port, 0)
+            self._dev.release_interface()
+            self._dev = None
 
 
 class DummyTrigger:
-    """No-op stand-in when serial is disabled."""
+    """No-op stand-in when TTL output is disabled."""
     def send_startle(self): pass
     def send_shock(self): pass
     def close(self): pass
@@ -525,9 +525,9 @@ class Display:
 # ════════════════════════════════════════════════════════════════
 
 def startup_screen(screen):
-    """Collect participant ID, block-order, and serial port selection.
+    """Collect participant ID, block-order, and connect the USB-6501 trigger.
 
-    Returns (participant_id: str, block_order: int, serial_port: str or None).
+    Returns (participant_id: str, block_order: int, trigger: NI6501Trigger or None).
     """
     W, H = screen.get_width(), screen.get_height()
     font_t = pygame.font.Font(None, 72)
@@ -536,10 +536,19 @@ def startup_screen(screen):
 
     pid = ""
     order = None
-    serial_port = None
-    ports = []
-    phase = "id"                  # 'id' → 'order' → 'serial'
+    trigger = None
+    ttl_error = ""
+    phase = "id"                  # 'id' → 'order' → 'ttl'
     clock = pygame.time.Clock()
+
+    def connect():
+        nonlocal trigger, ttl_error
+        try:
+            trigger = NI6501Trigger(TTL_PORT)
+            ttl_error = ""
+        except Exception as e:
+            trigger = None
+            ttl_error = f"{type(e).__name__}: {e}"
 
     while True:
         screen.fill(BG_COLOR)
@@ -561,17 +570,22 @@ def startup_screen(screen):
             _blit_center(screen, font_s,
                          "(Block 2 will use the opposite order)",
                          H * 3 // 4, MUTED_TEXT)
-        elif phase == "serial":
-            _blit_center(screen, font_t, "Select Serial Port", H // 6)
-            if ports:
-                y = H // 3
-                for i, p in enumerate(ports):
-                    label = f"Press {i + 1}:  {p.device}  ({p.description})"
-                    _blit_center(screen, font_m, label, y, HIGHLIGHT_COLOR)
-                    y += 50
+        elif phase == "ttl":
+            _blit_center(screen, font_t, "TTL Trigger (NI USB-6501)", H // 6)
+            if trigger:
+                _blit_center(screen, font_m,
+                             f"Connected — port {TTL_PORT}  "
+                             f"(startle {TTL_STARTLE}, shock {TTL_SHOCK})",
+                             H // 2 - 20, HIGHLIGHT_COLOR)
+                _blit_center(screen, font_m, "Press ENTER to continue",
+                             H // 2 + 40, HIGHLIGHT_COLOR)
             else:
-                _blit_center(screen, font_m, "No serial ports detected.",
-                             H // 2, (200, 0, 0))
+                _blit_center(screen, font_m, "USB-6501 not connected.",
+                             H // 2 - 40, (200, 0, 0))
+                _blit_center(screen, font_s, ttl_error[:100],
+                             H // 2 + 10, MUTED_TEXT)
+                _blit_center(screen, font_m, "Press R to retry",
+                             H // 2 + 70, HIGHLIGHT_COLOR)
             _blit_center(screen, font_s,
                          "Press 0 to skip (no TTL output)",
                          H * 3 // 4, MUTED_TEXT)
@@ -598,27 +612,21 @@ def startup_screen(screen):
                     elif ev.key in (pygame.K_2, pygame.K_KP2):
                         order = 2
                     if order is not None:
-                        if USE_SERIAL and HAS_PYSERIAL:
-                            ports = list(serial.tools.list_ports.comports())
-                            phase = "serial"
+                        if USE_TTL and HAS_NI6501:
+                            connect()
+                            phase = "ttl"
                         else:
                             return pid, order, None
-                elif phase == "serial":
+                elif phase == "ttl":
                     if ev.key in (pygame.K_0, pygame.K_KP0):
+                        if trigger:
+                            trigger.close()
                         return pid, order, None
-                    num_keys = [
-                        pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4,
-                        pygame.K_5, pygame.K_6, pygame.K_7, pygame.K_8,
-                        pygame.K_9,
-                    ]
-                    kp_keys = [
-                        pygame.K_KP1, pygame.K_KP2, pygame.K_KP3,
-                        pygame.K_KP4, pygame.K_KP5, pygame.K_KP6,
-                        pygame.K_KP7, pygame.K_KP8, pygame.K_KP9,
-                    ]
-                    for i, (nk, kp) in enumerate(zip(num_keys, kp_keys)):
-                        if ev.key in (nk, kp) and i < len(ports):
-                            return pid, order, ports[i].device
+                    if ev.key == pygame.K_r and not trigger:
+                        connect()
+                    elif (ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER)
+                          and trigger):
+                        return pid, order, trigger
 
         clock.tick(FPS)
 
@@ -808,15 +816,15 @@ def main():
     pygame.mouse.set_visible(False)
 
     # ── startup dialog ───────────────────────────────────────
-    pid, block_order, serial_port = startup_screen(screen)
+    pid, block_order, trigger = startup_screen(screen)
 
-    # ── initialise serial trigger ─────────────────────────────
-    if serial_port:
-        trigger = SerialTrigger(serial_port, SERIAL_BAUD)
-        print(f"[SERIAL] Opened {serial_port} @ {SERIAL_BAUD} baud")
+    # ── TTL trigger ──────────────────────────────────────────
+    if trigger:
+        print(f"[TTL] NI USB-6501 port {TTL_PORT}  "
+              f"(startle={TTL_STARTLE}, shock={TTL_SHOCK})")
     else:
         trigger = DummyTrigger()
-        print("[SERIAL] Disabled — no TTL output")
+        print("[TTL] Disabled — no TTL output")
 
     # ── prepare logging ──────────────────────────────────────
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
